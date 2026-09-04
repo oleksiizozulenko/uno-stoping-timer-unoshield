@@ -1,13 +1,14 @@
 #include <Arduino.h>
 
-// Pin definitions for Multi-Function Shield
 const int LATCH_PIN = 4;
 const int CLK_PIN   = 7;
 const int DATA_PIN  = 8;
-const int BUTTON_S1 = A1; // Stop & Reset
-const int BUTTON_S2 = A2; // Pause / Resume (Continue)
 
-// Segment byte map (Active LOW: 0 = ON, 1 = OFF)
+const int BUTTON_S1 = A1; // Stop & Start with reset
+const int BUTTON_S2 = A2; // Pause / Resume
+const int BUTTON_S3 = A3; // Mode switch: Timer / Words
+
+// 7-segment encoding (Active LOW)
 const byte SEGMENT_MAP[] = {
   0xC0, // 0
   0xF9, // 1
@@ -21,104 +22,133 @@ const byte SEGMENT_MAP[] = {
   0x90  // 9
 };
 
-// Active-high digit select masks
+struct WordPattern {
+  const char* label;
+  byte segs[4];
+};
+
+const WordPattern WORDS[] = {
+  { "HELL", { 0x89, 0x86, 0xC7, 0xC7 } },
+  { "HELP", { 0x89, 0x86, 0xC7, 0x8C } },
+  { "COOL", { 0xC6, 0xC0, 0xC0, 0xC7 } },
+  { "OPEN", { 0xC0, 0x8C, 0x86, 0xAB } },
+  { "STOP", { 0x92, 0x87, 0xC0, 0x8C } },
+  { "FIRE", { 0x8E, 0xF9, 0xAF, 0x86 } },
+  { "GOOD", { 0x90, 0xC0, 0xC0, 0xA1 } }
+};
+const byte NUM_WORDS = sizeof(WORDS) / sizeof(WORDS[0]);
+
 const byte DIGIT_SELECT[] = { 0x01, 0x02, 0x04, 0x08 };
 
-// Stopwatch state variables
+byte displayMode = 0; // 0 = timer, 1..N = words
+
 bool isRunning = true;
-unsigned long elapsedCentis = 0; // Increments every 10 ms (0.01s)
+unsigned long elapsedCentis = 0;
 unsigned long previousMillis = 0;
 
-// Debounce state tracking
-const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long DEBOUNCE_MS = 50;
 
-bool lastReadingS1 = HIGH;
-bool buttonStateS1 = HIGH;
+bool lastReadingS1 = HIGH, buttonStateS1 = HIGH;
 unsigned long lastDebounceTimeS1 = 0;
 
-bool lastReadingS2 = HIGH;
-bool buttonStateS2 = HIGH;
+bool lastReadingS2 = HIGH, buttonStateS2 = HIGH;
 unsigned long lastDebounceTimeS2 = 0;
+
+bool lastReadingS3 = HIGH, buttonStateS3 = HIGH;
+unsigned long lastDebounceTimeS3 = 0;
 
 void handleButtons() {
   unsigned long now = millis();
 
-  // --- Handle Button S1 (Reset & Stop) ---
+  // S1: Reset & Start/Stop
   int readingS1 = digitalRead(BUTTON_S1);
-  if (readingS1 != lastReadingS1) {
-    lastDebounceTimeS1 = now;
-  }
-  if ((now - lastDebounceTimeS1) > DEBOUNCE_DELAY) {
+  if (readingS1 != lastReadingS1) lastDebounceTimeS1 = now;
+  if ((now - lastDebounceTimeS1) > DEBOUNCE_MS) {
     if (readingS1 != buttonStateS1) {
       buttonStateS1 = readingS1;
       if (buttonStateS1 == LOW) {
-        isRunning = false;
-        elapsedCentis = 0; // Reset counter
+        elapsedCentis = 0;
+        isRunning = !isRunning;
       }
     }
   }
   lastReadingS1 = readingS1;
 
-  // --- Handle Button S2 (Pause / Continue) ---
+  // S2: Pause / Resume
   int readingS2 = digitalRead(BUTTON_S2);
-  if (readingS2 != lastReadingS2) {
-    lastDebounceTimeS2 = now;
-  }
-  if ((now - lastDebounceTimeS2) > DEBOUNCE_DELAY) {
+  if (readingS2 != lastReadingS2) lastDebounceTimeS2 = now;
+  if ((now - lastDebounceTimeS2) > DEBOUNCE_MS) {
     if (readingS2 != buttonStateS2) {
       buttonStateS2 = readingS2;
       if (buttonStateS2 == LOW) {
-        isRunning = !isRunning; // Toggle run/pause state
+        isRunning = !isRunning;
       }
     }
   }
   lastReadingS2 = readingS2;
+
+  // S3: Cycle modes (Timer -> Word 1 -> Word 2 ... -> Timer)
+  int readingS3 = digitalRead(BUTTON_S3);
+  if (readingS3 != lastReadingS3) lastDebounceTimeS3 = now;
+  if ((now - lastDebounceTimeS3) > DEBOUNCE_MS) {
+    if (readingS3 != buttonStateS3) {
+      buttonStateS3 = readingS3;
+      if (buttonStateS3 == LOW) {
+        displayMode = (displayMode + 1) % (NUM_WORDS + 1);
+      }
+    }
+  }
+  lastReadingS3 = readingS3;
 }
 
 void updateTimer() {
   if (isRunning) {
-    unsigned long currentMillis = millis();
-    if (currentMillis - previousMillis >= 10) {
-      previousMillis = currentMillis;
+    unsigned long now = millis();
+    if (now - previousMillis >= 10) {
+      previousMillis = now;
       elapsedCentis++;
       if (elapsedCentis > 9999) {
-        elapsedCentis = 0; // Rollover at 99.99s
+        elapsedCentis = 0;
       }
     }
   } else {
-    // Keep baseline synchronized while paused to avoid jumps on resume
     previousMillis = millis();
   }
 }
 
-void renderDisplay() {
-  byte digits[4];
-  digits[0] = (elapsedCentis / 1000) % 10;
-  digits[1] = (elapsedCentis / 100) % 10;
-  digits[2] = (elapsedCentis / 10) % 10;
-  digits[3] = elapsedCentis % 10;
+void sendFrame(byte segData, byte digitMask) {
+  // Clear outputs before latching new data to avoid ghosting
+  digitalWrite(LATCH_PIN, LOW);
+  shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, 0xFF);
+  shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, 0x00);
+  digitalWrite(LATCH_PIN, HIGH);
+
+  digitalWrite(LATCH_PIN, LOW);
+  shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, segData);
+  shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, digitMask);
+  digitalWrite(LATCH_PIN, HIGH);
+
+  delayMicroseconds(500);
+}
+
+void renderStopwatch() {
+  byte digits[4] = {
+    (byte)((elapsedCentis / 1000) % 10),
+    (byte)((elapsedCentis / 100) % 10),
+    (byte)((elapsedCentis / 10) % 10),
+    (byte)(elapsedCentis % 10)
+  };
 
   for (byte i = 0; i < 4; i++) {
     byte segData = SEGMENT_MAP[digits[i]];
+    if (i == 1) segData &= 0x7F; // decimal point on digit 2
+    sendFrame(segData, DIGIT_SELECT[i]);
+  }
+}
 
-    // Decimal point on digit index 1 (format: XX.YY)
-    if (i == 1) {
-      segData &= 0x7F;
-    }
-
-    // Blank the display before shifting to eliminate segment ghosting
-    digitalWrite(LATCH_PIN, LOW);
-    shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, 0xFF);
-    shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, 0x00);
-    digitalWrite(LATCH_PIN, HIGH);
-
-    // Send active digit data
-    digitalWrite(LATCH_PIN, LOW);
-    shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, segData);
-    shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, DIGIT_SELECT[i]);
-    digitalWrite(LATCH_PIN, HIGH);
-
-    delayMicroseconds(500);
+void renderWord(const byte segs[4]) {
+  for (byte i = 0; i < 4; i++) {
+    sendFrame(segs[i], DIGIT_SELECT[i]);
   }
 }
 
@@ -129,10 +159,16 @@ void setup() {
 
   pinMode(BUTTON_S1, INPUT_PULLUP);
   pinMode(BUTTON_S2, INPUT_PULLUP);
+  pinMode(BUTTON_S3, INPUT_PULLUP);
 }
 
 void loop() {
   handleButtons();
   updateTimer();
-  renderDisplay();
+
+  if (displayMode == 0) {
+    renderStopwatch();
+  } else {
+    renderWord(WORDS[displayMode - 1].segs);
+  }
 }
