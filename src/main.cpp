@@ -21,7 +21,7 @@ const byte SEGMENT_MAP[] = {
 };
 
 // Digit select masks (Digit 0 = leftmost, Digit 3 = rightmost)
-const byte DIGIT_SELECT[] = { 0xF1, 0xF2, 0xF4, 0xF8 };
+const byte DIGIT_SELECT[] = { 0x01, 0x02, 0x04, 0x08 };
 
 // Stopwatch state variables
 bool isRunning = true;
@@ -76,26 +76,31 @@ void updateTimer() {
 // Multiplexes each digit to eliminate flickering
 void renderDisplay() {
   byte digits[4];
-  digits[0] = (elapsedCentis / 1000) % 10; // Tens of seconds
-  digits[1] = (elapsedCentis / 100) % 10;  // Units of seconds
-  digits[2] = (elapsedCentis / 10) % 10;   // Tenths
-  digits[3] = elapsedCentis % 10;          // Hundredths
+  digits[0] = (elapsedCentis / 1000) % 10;
+  digits[1] = (elapsedCentis / 100) % 10;
+  digits[2] = (elapsedCentis / 10) % 10;
+  digits[3] = elapsedCentis % 10;
 
   for (byte i = 0; i < 4; i++) {
     byte segData = SEGMENT_MAP[digits[i]];
 
-    // Add decimal point after the second digit (XX.YY)
     if (i == 1) {
-      segData &= 0x7F; // Clear bit 7 to turn on the decimal point
+      segData &= 0x7F; // Decimal point for second digit
     }
 
-    // Send data to 74HC595 shift registers
+    // --- STEP 1: Turn all segments OFF (blanking) to kill ghosting ---
+    digitalWrite(LATCH_PIN, LOW);
+    shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, 0xFF); // 0xFF turns all segments OFF
+    shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, 0x00); // 0x00 turns all digit transistors OFF
+    digitalWrite(LATCH_PIN, HIGH);
+
+    // --- STEP 2: Send actual data for digit i ---
     digitalWrite(LATCH_PIN, LOW);
     shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, segData);
     shiftOut(DATA_PIN, CLK_PIN, MSBFIRST, DIGIT_SELECT[i]);
     digitalWrite(LATCH_PIN, HIGH);
 
-    delayMicroseconds(500); // Brief persistence delay per digit
+    delayMicroseconds(500);
   }
 }
 
